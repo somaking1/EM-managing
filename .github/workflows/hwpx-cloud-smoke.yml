@@ -1,0 +1,110 @@
+name: HWPX cloud smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/hwpx-cloud-smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install pinned HWPX stack
+        run: python -m pip install "python-hwpx==6.11.0" "python-hwpx-automation[oracle,hwp,mcp]==7.4.1"
+      - name: Check dependency compatibility
+        run: python -m pip check
+      - name: Test editable text, equations, inline shape, page break and HWP import
+        shell: python
+        run: |
+          import importlib.metadata as md
+          import json, pathlib, platform, subprocess, sys, zipfile
+          from lxml import etree
+          from hwpx import HwpxDocument
+
+          # Synthetic compatibility fixture only. No user textbook or private data.
+          out = pathlib.Path("hwpx-smoke-output")
+          out.mkdir()
+          HP = "{http://www.hancom.co.kr/hwpml/2011/paragraph}"
+          HH = "{http://www.hancom.co.kr/hwpml/2011/head}"
+          doc = HwpxDocument.new()
+          sec = doc.sections[0]
+          sec.properties.set_page_size(width=59528, height=84189, orientation="PORTRAIT")
+          p1 = doc.add_paragraph("1. 환경 시험용 문항입니다. 아래 수식을 확인하세요.")
+          doc.add_equation("x ^{2} + y ^{2} = 1", paragraph=p1, base_unit=3200)
+          doc.shapes.add_rectangle(7200, 3600, section=sec)
+          p2 = doc.add_paragraph("2. 환경 시험용 두 번째 문항입니다.")
+          p2.element.set("pageBreak", "1")
+          doc.add_equation("{1} over {2}", paragraph=p2, base_unit=3200)
+          for header in doc.parts.headers:
+              for cp in header.element.iter(HH + "charPr"):
+                  cp.set("height", "3200")
+              header.mark_dirty()
+          for pos in sec.element.iter(HP + "pos"):
+              pos.set("treatAsChar", "1")
+          sec.mark_dirty()
+          hwpx_path = out / "synthetic-test.hwpx"
+          doc.save_to_path(hwpx_path)
+          with zipfile.ZipFile(hwpx_path) as z:
+              assert z.testzip() is None
+              root = etree.fromstring(z.read("Contents/section0.xml"))
+              header = etree.fromstring(z.read("Contents/header.xml"))
+              scripts = [e.text for e in root.iter(HP + "script")]
+              assert scripts == ["x ^{2} + y ^{2} = 1", "{1} over {2}"], scripts
+              assert all(e.get("baseUnit") == "3200" for e in root.iter(HP + "equation"))
+              assert all(e.get("height") == "3200" for e in header.iter(HH + "charPr"))
+              assert sum(p.get("pageBreak") == "1" for p in root.iter(HP + "p")) == 1
+              shapes = list(root.iter(HP + "rect"))
+              assert len(shapes) == 1
+              assert shapes[0].find(HP + "pos").get("treatAsChar") == "1"
+              page = next(root.iter(HP + "pagePr"))
+              assert int(page.get("width")) < int(page.get("height"))
+          reopened = HwpxDocument.open(hwpx_path)
+          assert any("환경 시험용" in p.text for p in reopened.paragraphs)
+
+          # Exercise the HWP5 binary reader as well as HWPX ZIP/XML.
+          hwp_path = out / "synthetic-test.hwp"
+          reopened.save_to_path(hwp_path)
+          assert hwp_path.read_bytes()[:8] == bytes.fromhex("d0cf11e0a1b11ae1")
+          imported = HwpxDocument.open(hwp_path)
+          imported_scripts = [e.text for s in imported.sections for e in s.element.iter(HP + "script")]
+          assert imported_scripts == scripts, imported_scripts
+          assert sum(1 for s in imported.sections for e in s.element.iter(HP + "rect")) == 1
+          imported.save_to_path(out / "synthetic-roundtrip.hwpx")
+
+          # Report real rendering separately; Linux has no licensed Hancom instance.
+          render = subprocess.run(
+              ["hwpx", "render-pdf", str(hwpx_path), str(out / "preview.pdf"), "--json", "--timeout", "20"],
+              capture_output=True, text=True, timeout=45
+          )
+          report = {
+              "python": sys.version.split()[0],
+              "platform": platform.platform(),
+              "packages": {n: md.version(n) for n in ["python-hwpx", "python-hwpx-automation", "lxml", "mcp"]},
+              "fixture": "synthetic; no user source",
+              "zip_and_xml": "passed",
+              "editable_equations_32pt": "passed",
+              "body_32pt": "passed",
+              "explicit_page_break": "passed",
+              "portrait": "passed",
+              "inline_shape": "passed",
+              "hwp_binary_roundtrip_text_equations_shape": "passed",
+              "hwp_conversion_report": str(imported.conversion_report),
+              "hancom_render_exit_code": render.returncode,
+              "hancom_render_stdout": render.stdout.strip(),
+              "hancom_render_stderr": render.stderr[-2000:],
+              "production_source_tested": False,
+              "actual_page_count_verified": False
+          }
+          (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          if render.returncode not in (0, 3):
+              raise RuntimeError("Unexpected renderer failure; inspect report")
